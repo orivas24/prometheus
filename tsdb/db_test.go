@@ -2793,3 +2793,70 @@ func TestOpen_VariousBlockStates(t *testing.T) {
 	}
 	testutil.Equals(t, len(expectedIgnoredDirs), ignored)
 }
+
+// RegressionTest: https://github.com/prometheus/prometheus/issues/7776
+func TestDBQueriers_BytesNotReused(t *testing.T) {
+	hb, wal := newTestHead(t, 20, false)
+	t.Cleanup(func() {
+		testutil.Ok(t, hb.Close())
+	})
+
+	createBlock(t, wal.Dir(), genSeries(1, 2, 0, 200))
+
+	app := hb.Appender(context.Background())
+	s := genSeries(1, 2, 200, 300)
+	iter := s[0].Iterator()
+	for iter.Next() {
+		ts, v := iter.At()
+		_, err := app.Add(s[0].Labels(), ts, v)
+		testutil.Ok(t, err)
+	}
+	testutil.Ok(t, iter.Err())
+	testutil.Ok(t, app.Commit())
+
+	// Select samples and keep labels.
+	var series storage.Series
+	{
+		q, err := NewBlockQuerier(hb, 0, 100000)
+		testutil.Ok(t, err)
+		res := q.Select(false, nil, labels.MustNewMatcher(labels.MatchRegexp, defaultLabelName, ".*"))
+		testutil.Assert(t, res.Next(), "expected one series")
+		series = res.At()
+		testutil.Assert(t, !res.Next(), "no more series expected")
+		testutil.Ok(t, res.Err())
+		testutil.Equals(t, 0, len(res.Warnings()))
+	}
+
+	var chunkSeries storage.ChunkSeries
+	{
+		q, err := NewBlockChunkQuerier(hb, 0, 100000)
+		testutil.Ok(t, err)
+		res := q.Select(false, nil, labels.MustNewMatcher(labels.MatchRegexp, defaultLabelName, ".*"))
+		testutil.Assert(t, res.Next(), "expected one series")
+		chunkSeries = res.At()
+		testutil.Assert(t, !res.Next(), "no more series expected")
+		testutil.Ok(t, res.Err())
+		testutil.Equals(t, 0, len(res.Warnings()))
+	}
+
+	check := func() {
+		testutil.Equals(t, defaultLabelName, series.Labels()[0].Name)
+		testutil.Equals(t, "0", series.Labels()[0].Value)
+		testutil.Equals(t, defaultLabelName+"1", series.Labels()[1].Name)
+		testutil.Equals(t, defaultLabelValue+"1", series.Labels()[1].Value)
+
+		smpls, err := storage.ExpandSamples(series.Iterator(), newSample)
+		testutil.Ok(t, err)
+		testutil.Equals(t, 20, len(smpls))
+
+		testutil.Equals(t, defaultLabelName, chunkSeries.Labels()[0].Name)
+		testutil.Equals(t, "0", chunkSeries.Labels()[0].Value)
+		testutil.Equals(t, defaultLabelName+"1", chunkSeries.Labels()[1].Name)
+		testutil.Equals(t, defaultLabelValue+"1", chunkSeries.Labels()[1].Value)
+
+		chks, err := storage.ExpandChunks(chunkSeries.Iterator())
+		testutil.Ok(t, err)
+		testutil.Equals(t, 1, len(chks))
+	}
+	check()
+}
